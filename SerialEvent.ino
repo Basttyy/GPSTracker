@@ -1,14 +1,14 @@
-#include <SpritzCipher.h>
 #include <EEPROM.h>
+#include <AESLib.h> 
 #include <SoftwareSerial.h>
 #include <time.h>
 #include <SD.h>
+#include <SPI.h>
 
 #define PASSWORDLEN     16
-#define CHUNKSIZE      64
+#define CHUNKSIZE       16
 //#define DEBUG
 
-#define chipSelect 4
 
 class Logger {
   public:
@@ -19,13 +19,13 @@ class Logger {
   private:
     void updatetime(void);
     void settime(void);
-    void enternewpassword(void);
-    void commitpassword(void);
     void loadpassword(void);
     bool askuser(const char *msg);
     void serialFlush(void);
-    uint8_t password[PASSWORDLEN + 1];
-    spritz_ctx s_ctx;
+    void InitTime(void);
+    void InitCrypto(void);
+    uint8_t password[PASSWORDLEN];
+    aes_context ctx;
     File dataFile;
     String streambuffer;
 };
@@ -45,22 +45,22 @@ void setup()
 
 void loop()
 {
-    #ifdef DEBUG
-      Serial.println("looping...");
-    #endif
+    Serial.println("looping");
     //Save current date to EEPROM
     time_t t = millis() / 1000 + time_offset;
     mylogger->savetime(t);
     const char *strtime = ctime(&t);
     Serial.println(strtime);
     mylogger->AddData((uint8_t *)strtime, strlen(strtime));
+    mylogger->AddData((uint8_t *)";", 1);
     //Add position data
     #ifdef DEBUG
     Serial.println("powering up");
     #endif
     digitalWrite(15, HIGH);
-    delay(180000);//let the GPS 5 min to sync
+    delay(300000);//let the GPS 5 min to sync
     mylogger->LogGPSPosition();
+    mylogger->AddData((uint8_t *)"\n", 1);
     #ifdef DEBUG
     Serial.println("powering down");
     #endif
@@ -117,35 +117,6 @@ void Logger::loadpassword(void)
     #endif
 }
 
-void Logger::commitpassword(void)
-{
-  for(int i=0; i<PASSWORDLEN; i++)
-    EEPROM.update(i, password[i]);
-  #ifdef DEBUG
-    Serial.print("committed=");
-    Serial.println((char *)password);
-  #endif
-}
-
-void Logger::enternewpassword(void)
-{
-  int counter = 0;
-  Serial.println("Enter new 16 bits password:");
-  while(counter < PASSWORDLEN)
-  {
-    int val = Serial.read();
-    if(val > 0) {
-      password[counter] = (uint8_t)val;
-      counter++;
-    }
-  }
-  password[PASSWORDLEN] = '\x00';
-  #ifdef DEBUG
-    Serial.print("new password=");
-    Serial.println((char *)password);
-  #endif
-}
-
 void Logger::AddData(uint8_t *msg, int msglen)
 {
   uint8_t cryptobuf[CHUNKSIZE];
@@ -153,8 +124,10 @@ void Logger::AddData(uint8_t *msg, int msglen)
   for(unsigned int i=0; i<msglen; i++)
     streambuffer += (char)msg[i];
   if(streambuffer.length() > CHUNKSIZE) {
-    spritz_crypt(&s_ctx, (uint8_t *)streambuffer.substring(0, CHUNKSIZE).c_str(), CHUNKSIZE, cryptobuf);
+    memcpy(cryptobuf, streambuffer.c_str(), CHUNKSIZE);
+    aes192_cbc_enc_continue(ctx, cryptobuf, CHUNKSIZE);
     dataFile.write(cryptobuf, CHUNKSIZE);
+    dataFile.flush();
     streambuffer = streambuffer.substring(CHUNKSIZE);
     AddData(NULL, 0);
   }
@@ -208,40 +181,53 @@ void Logger::settime(void)
    savetime(time_offset);
 }
 
-Logger::Logger()
+
+void Logger::InitTime(void)
 {
-  //password = (uint8_t *)malloc(PASSWORDLEN + 1);
-  while(!SD.begin(chipSelect)){
-    Serial.println("SD card not found");
-    delay(1000);
-  }
-  #ifdef DEBUG
-    Serial.println("SD card OK");
-  #endif
   if(askuser("set time?"))
     settime();
   else
     updatetime();
-  Serial.print("time OK: ");
-  time_t t = millis() / 1000 + time_offset;
-  Serial.println(ctime(&t));
-  if(askuser("set new password?")) {
-    enternewpassword();
-    if(askuser("commit password?"))
-      commitpassword();
+}
+
+void Logger::InitCrypto(void)
+{
+  if(askuser("set new 16 bits pwd?")) {
+    int counter = 0;
+    while(counter < PASSWORDLEN)
+    {
+      int val = Serial.read();
+      if(val > 0) {
+        password[counter] = (uint8_t)val;
+        counter++;
+      }
+    }
+    password[counter] = '\x00';
+    if(askuser("commit password?")) {
+      for(int i=0; i<PASSWORDLEN; i++) {
+        EEPROM.update(i, password[i]);
+      }
+    }
   } else {
     loadpassword();
   }
-  #ifdef DEBUG
-    Serial.println("Initialyze crypto");
-  #endif
-  spritz_setup(&s_ctx, password, PASSWORDLEN);
-  #ifdef DEBUG
-    Serial.print("password=");
-    Serial.println((char *)password);
-  #endif
+  ctx = aes128_cbc_enc_start(password,password);
+}
+
+Logger::Logger()
+{
+  InitTime();
+  InitCrypto();
   char filename[10];
-  snprintf(filename, sizeof(filename), "%x\x00", t);
-  dataFile = SD.open(filename, FILE_WRITE);
+  snprintf(filename, sizeof(filename), "%x.bin", millis() / 1000 + time_offset);
+  while(!SD.begin(4)) {
+    Serial.println("SD card not found");
+    delay(1000);
+  }
+  while(!dataFile) {
+    dataFile = SD.open(filename, FILE_WRITE);
+    Serial.println(filename);
+    delay(1000);
+  }
 }
 
